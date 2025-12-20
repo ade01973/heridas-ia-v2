@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import OpenAI from 'openai';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { google } from 'googleapis';
+import { Readable } from 'stream';
 
 // --- CONFIGURACIÓN DE MENÚS EXACTOS + CUIDADOS ---
 const SYSTEM_PROMPT_BASE = `
@@ -10,7 +11,6 @@ Debes elegir la opción que mejor encaje de las listas EXACTAS para los campos d
 
 IMPORTANTE:
 Se te proporcionará contexto del paciente (Edad, Diabetes, etc.). USA ESE CONTEXTO para personalizar el campo "recomendaciones_cuidados".
-Por ejemplo, si es diabético, enfócate en control glucémico y descargas. Si tiene patología vascular, adapta el vendaje, etc.
 
 Listas EXACTAS:
 - etiologia_probable: [
@@ -68,7 +68,6 @@ Responde SOLO con el JSON válido.
 
 export async function POST(request: Request) {
   try {
-    // AHORA RECIBIMOS TAMBIÉN 'patientData'
     const { image, modelId, identificationCode, patientData } = await request.json();
     
     const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY || '' });
@@ -76,7 +75,7 @@ export async function POST(request: Request) {
 
     if (!image) return NextResponse.json({ error: 'Falta imagen' }, { status: 400 });
 
-    // Construimos el contexto del paciente para la IA
+    // Construimos el contexto
     const patientContext = `
       CONTEXTO DEL PACIENTE:
       - Edad: ${patientData?.edad || 'No especificada'}
@@ -86,15 +85,13 @@ export async function POST(request: Request) {
       - Diabético: ${patientData?.diabetico || 'No'}
     `;
 
-    // Unimos el prompt base con el contexto del paciente
     const FINAL_PROMPT = SYSTEM_PROMPT_BASE + "\n" + patientContext;
-
     let result = null;
 
     // 1. ANÁLISIS IA
     try {
       if (modelId === 'gemini') {
-        const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+        const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
         const cleanBase64 = image.replace(/^data:image\/\w+;base64,/, "");
         const response = await model.generateContent([
           FINAL_PROMPT,
@@ -118,8 +115,10 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: `Error en la IA: ${aiError.message}` }, { status: 500 });
     }
 
-    // 2. GUARDAR EN SHEET (IGNORAMOS DATOS PACIENTE Y CUIDADOS)
+    // 2. SUBIR A DRIVE Y GUARDAR EN SHEET
     let sheetStatus = 'No configurado';
+    let driveLink = 'No guardada';
+
     if (process.env.GOOGLE_SHEET_ID && process.env.GOOGLE_CLIENT_EMAIL && process.env.GOOGLE_PRIVATE_KEY) {
       try {
         const auth = new google.auth.GoogleAuth({
@@ -127,11 +126,52 @@ export async function POST(request: Request) {
             client_email: process.env.GOOGLE_CLIENT_EMAIL,
             private_key: process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n'),
           },
-          scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+          scopes: [
+            'https://www.googleapis.com/auth/spreadsheets',
+            'https://www.googleapis.com/auth/drive.file' 
+          ],
         });
+
+        // A) SUBIR FOTO A DRIVE (Si hay ID de carpeta configurada)
+        if (process.env.GOOGLE_DRIVE_FOLDER_ID) {
+          try {
+            const drive = google.drive({ version: 'v3', auth });
+            
+            // Convertir Base64 a Stream
+            const cleanBase64 = image.replace(/^data:image\/\w+;base64,/, "");
+            const buffer = Buffer.from(cleanBase64, 'base64');
+            const stream = new Readable();
+            stream.push(buffer);
+            stream.push(null);
+
+            const fileMetadata = {
+              name: `Herida_${identificationCode || 'SinID'}_${Date.now()}.jpg`,
+              parents: [process.env.GOOGLE_DRIVE_FOLDER_ID],
+            };
+            
+            const media = {
+              mimeType: 'image/jpeg',
+              body: stream,
+            };
+
+            const file = await drive.files.create({
+              requestBody: fileMetadata,
+              media: media,
+              fields: 'id, webViewLink',
+            });
+
+            driveLink = file.data.webViewLink || 'Error Link';
+            console.log("Foto subida a Drive:", driveLink);
+
+          } catch (driveError: any) {
+            console.error("Error subiendo a Drive:", driveError);
+            driveLink = `Error Drive: ${driveError.message}`;
+          }
+        }
+
+        // B) GUARDAR EN SHEET
         const sheets = google.sheets({ version: 'v4', auth });
         
-        // MANTENEMOS TU ESTRUCTURA ORIGINAL EXACTA
         const row = [
           new Date().toLocaleString(),          // Col A
           identificationCode,                   // Col B
@@ -144,24 +184,25 @@ export async function POST(request: Request) {
           result.aposito_primario,              // Col I
           "Inteligencia Artificial",            // Col J
           modelId === 'chatgpt' ? 'ChatGPT' : 'Gemini', // Col K
-          "Prompt v1.0"                         // Col L
+          "Versión v2.1 (Con Foto)",            // Col L
+          driveLink                             // Col M (NUEVA: LINK FOTO)
         ];
 
         await sheets.spreadsheets.values.append({
           spreadsheetId: process.env.GOOGLE_SHEET_ID,
-          range: 'Respuestas_IA!A:L',
+          range: 'Respuestas_IA!A:M', 
           valueInputOption: 'USER_ENTERED',
           insertDataOption: 'INSERT_ROWS',
           requestBody: { values: [row] },
         });
         sheetStatus = 'Guardado OK';
       } catch (e: any) {
-        console.error("Error Sheet:", e);
-        sheetStatus = `Fallo Excel: ${e.message}`; 
+        console.error("Error Sheet/Drive:", e);
+        sheetStatus = `Fallo Google: ${e.message}`; 
       }
     }
 
-    return NextResponse.json({ ...result, sheetStatus });
+    return NextResponse.json({ ...result, sheetStatus, driveLink });
 
   } catch (error: any) {
     console.error("Error General:", error);
