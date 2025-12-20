@@ -1,2 +1,0 @@
-# heridas-ia-final
-Test
