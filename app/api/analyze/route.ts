@@ -101,7 +101,7 @@ export async function POST(request: Request) {
         result = JSON.parse(text);
       } else {
         const response = await openai.chat.completions.create({
-          model: "gpt-4o",
+          model: "gpt-4o-mini",
           messages: [
             { role: "system", content: FINAL_PROMPT },
             { role: "user", content: [{ type: "image_url", image_url: { url: image } }] },
